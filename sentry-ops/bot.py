@@ -5,18 +5,20 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import subprocess
 import tarfile
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiohttp
 import nmap
 import paramiko
-from aiogram import Bot, Dispatcher
+import yaml
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,6 +60,13 @@ DRIFT_CHECK_INTERVAL_HOURS = int(os.environ.get("DRIFT_CHECK_INTERVAL_HOURS", "2
 DRIFT_WATCH_PATHS = os.environ.get("DRIFT_WATCH_PATHS", "")
 BASELINE_DIR = "/app/data/baseline"
 
+# ---------- On-call эскалация ----------
+ESCALATION_MINUTES = int(os.environ.get("ESCALATION_MINUTES", "30"))
+ESCALATION_CHECK_MINUTES = int(os.environ.get("ESCALATION_CHECK_MINUTES", "10"))
+
+# ---------- Blast radius (docker-compose файлы по нодам, тот же формат что DRIFT_WATCH_PATHS) ----------
+COMPOSE_PATHS = os.environ.get("COMPOSE_PATHS", "")
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
@@ -76,6 +85,13 @@ def db():
         hosts_up INTEGER, new_ports INTEGER, closed_ports INTEGER)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS backup_checks (
         id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT, ok INTEGER, detail TEXT, checked_at TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, command TEXT, chat_id TEXT, ts TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS maintenance (
+        host TEXT PRIMARY KEY, until_ts TEXT, reason TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, message TEXT, severity TEXT,
+        sent_at TEXT, acked INTEGER DEFAULT 0, escalated INTEGER DEFAULT 0)""")
     return conn
 
 
@@ -88,6 +104,99 @@ def parse_nodes():
         host, _, label = entry.partition(":")
         result.append((host.strip(), label.strip() or host.strip()))
     return result
+
+
+def log_audit(command: str, chat_id):
+    conn = db()
+    conn.execute("INSERT INTO audit (command, chat_id, ts) VALUES (?,?,?)",
+                 (command, str(chat_id), datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+# ================= MAINTENANCE MODE =================
+
+def set_maintenance(host: str, minutes: int, reason: str = ""):
+    conn = db()
+    until = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat()
+    conn.execute("INSERT OR REPLACE INTO maintenance (host, until_ts, reason) VALUES (?,?,?)",
+                 (host, until, reason))
+    conn.commit()
+    conn.close()
+    return until
+
+
+def clear_maintenance(host: str):
+    conn = db()
+    conn.execute("DELETE FROM maintenance WHERE host=?", (host,))
+    conn.commit()
+    conn.close()
+
+
+def in_maintenance(host: str) -> bool:
+    conn = db()
+    row = conn.execute("SELECT until_ts FROM maintenance WHERE host=?", (host,)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return datetime.fromisoformat(row[0]) > datetime.utcnow()
+
+
+def list_maintenance():
+    conn = db()
+    rows = conn.execute("SELECT host, until_ts, reason FROM maintenance").fetchall()
+    conn.close()
+    now = datetime.utcnow()
+    return [(h, u, r) for h, u, r in rows if datetime.fromisoformat(u) > now]
+
+
+# ================= ON-CALL ESCALATION =================
+
+async def send_alert(chat, host: str, text: str, severity: str = "high"):
+    """Отправляет алерт с кнопкой подтверждения; неподтверждённые эскалируются."""
+    conn = db()
+    now = datetime.utcnow().isoformat()
+    cur = conn.execute("INSERT INTO alerts (host, message, severity, sent_at) VALUES (?,?,?,?)",
+                        (host, text, severity, now))
+    alert_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ack:{alert_id}")
+    ]])
+    await bot.send_message(chat, text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("ack:"))
+async def cb_ack(callback: CallbackQuery):
+    alert_id = int(callback.data.split(":", 1)[1])
+    conn = db()
+    conn.execute("UPDATE alerts SET acked=1 WHERE id=?", (alert_id,))
+    conn.commit()
+    conn.close()
+    await callback.answer("Подтверждено ✅")
+    try:
+        await callback.message.edit_text(callback.message.text + "\n\n✅ Подтверждено")
+    except Exception:
+        pass
+
+
+async def job_check_escalations():
+    conn = db()
+    cutoff = (datetime.utcnow() - timedelta(minutes=ESCALATION_MINUTES)).isoformat()
+    rows = conn.execute(
+        "SELECT id, host, message, severity, sent_at FROM alerts "
+        "WHERE acked=0 AND escalated=0 AND sent_at < ?", (cutoff,)
+    ).fetchall()
+    for alert_id, host, message, severity, sent_at in rows:
+        conn.execute("UPDATE alerts SET escalated=1 WHERE id=?", (alert_id,))
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ack:{alert_id}")
+        ]])
+        text = (f"⚠️ ПОВТОРНО (не подтверждено {ESCALATION_MINUTES} мин.)\n\n{message}")
+        await bot.send_message(CHAT_ID, text, reply_markup=kb)
+    conn.commit()
+    conn.close()
 
 
 # ================= NETWORK SCAN =================
@@ -176,20 +285,25 @@ def store_findings(findings: list):
     conn.close()
 
 
-async def explain_finding(text: str) -> str:
+async def ask_ollama(prompt: str, timeout: int = 60) -> str:
     if not OLLAMA_HOST:
         return ""
-    prompt = (f"Кратко (2-3 предложения, по-русски) объясни для домашнего сервера/сисадмина, "
-              f"что означает эта находка сканера безопасности и что с ней делать:\n{text}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{OLLAMA_HOST}/api/generate",
                                      json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                                     timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                                     timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                 data = await resp.json()
                 return data.get("response", "").strip()
-    except Exception:
+    except Exception as e:
+        log.warning("Ollama request failed: %s", e)
         return ""
+
+
+async def explain_finding(text: str) -> str:
+    prompt = (f"Кратко (2-3 предложения, по-русски) объясни для домашнего сервера/сисадмина, "
+              f"что означает эта находка сканера безопасности и что с ней делать:\n{text}")
+    return await ask_ollama(prompt, timeout=60)
 
 
 async def job_network_scan(manual_chat_id: int | None = None):
@@ -198,6 +312,10 @@ async def job_network_scan(manual_chat_id: int | None = None):
     loop = asyncio.get_event_loop()
     scan_results = await loop.run_in_executor(None, run_nmap_scan, SUBNET)
     new_entries, closed_entries = diff_and_store(scan_results)
+
+    # фильтруем хосты в maintenance-режиме
+    new_entries = [(h, p) for h, p in new_entries if not in_maintenance(h)]
+    closed_entries = [c for c in closed_entries if not in_maintenance(c["host"])]
 
     if new_entries:
         lines = ["🆕 Новые открытые порты:"]
@@ -215,6 +333,8 @@ async def job_network_scan(manual_chat_id: int | None = None):
 
     targets = []
     for host, ports in scan_results.items():
+        if in_maintenance(host):
+            continue
         for p in ports:
             if p["service"] in ("http", "https", "http-proxy", "http-alt") or p["port"] in (80, 443, 8080, 8443):
                 scheme = "https" if p["service"] == "https" or p["port"] == 443 else "http"
@@ -234,7 +354,10 @@ async def job_network_scan(manual_chat_id: int | None = None):
                 explanation = await explain_finding(f"{name} on {host}, severity {sev}")
                 if explanation:
                     text += f"\n💡 {explanation}"
-                await bot.send_message(chat, text)
+                if sev in ("critical", "high"):
+                    await send_alert(chat, host, text, severity=sev)
+                else:
+                    await bot.send_message(chat, text)
         else:
             await bot.send_message(chat, "✅ Nuclei ничего не нашёл.")
 
@@ -316,13 +439,19 @@ async def job_backup_verify(manual_chat_id: int | None = None):
     conn = db()
     now = datetime.utcnow().isoformat()
     lines = ["📦 Проверка бэкапов:"]
+    any_failed = False
     for source, ok, detail in results:
         lines.append(f"{'✅' if ok else '🔴'} {source}: {detail}")
+        if not ok:
+            any_failed = True
         conn.execute("INSERT INTO backup_checks (source,ok,detail,checked_at) VALUES (?,?,?,?)",
                      (source, int(ok), detail, now))
     conn.commit()
     conn.close()
-    await bot.send_message(chat, "\n".join(lines))
+    if any_failed:
+        await send_alert(chat, "backup", "\n".join(lines), severity="high")
+    else:
+        await bot.send_message(chat, "\n".join(lines))
 
 
 # ================= DOCKER BLOAT =================
@@ -349,7 +478,28 @@ def analyze_node_bloat(host: str, label: str) -> dict:
     if not ok:
         return {"label": label, "host": host, "error": df_out}
     dangling_count = len([l for l in dangling_out.strip().splitlines() if l.strip()]) if ok2 and dangling_out.strip() else 0
-    return {"label": label, "host": host, "df_raw": df_out.strip(), "dangling_count": dangling_count, "error": None}
+
+    rows = []
+    for line in df_out.strip().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    return {"label": label, "host": host, "rows": rows, "dangling_count": dangling_count, "error": None}
+
+
+def parse_size_to_gb(size_str: str) -> float:
+    """'43.37GB' / '930MB' / '0B' -> число в ГБ."""
+    if not size_str:
+        return 0.0
+    size_str = size_str.strip()
+    m = re.match(r"([\d.]+)\s*([A-Za-z]+)", size_str)
+    if not m:
+        return 0.0
+    value, unit = float(m.group(1)), m.group(2).upper()
+    mult = {"B": 1e-9, "KB": 1e-6, "MB": 1e-3, "GB": 1, "TB": 1000}.get(unit, 0)
+    return value * mult
 
 
 async def job_docker_bloat(manual_chat_id: int | None = None):
@@ -359,7 +509,13 @@ async def job_docker_bloat(manual_chat_id: int | None = None):
     await bot.send_message(chat, f"🔎 Docker на {len(nodes)} нодах...")
     lines = ["🐳 Docker bloat отчёт:"]
     any_ok = False
+    skipped = []
+    node_summaries = []  # для AI-резюме: (label, host, reclaimable_gb, dangling_count, details)
+
     for host, label in nodes:
+        if in_maintenance(host):
+            skipped.append(label)
+            continue
         result = await loop.run_in_executor(None, analyze_node_bloat, host, label)
         if result.get("error"):
             lines.append(f"\n📍 {label} ({host}) — ❌ {result['error'][:150]}")
@@ -367,13 +523,45 @@ async def job_docker_bloat(manual_chat_id: int | None = None):
         any_ok = True
         lines.append(f"\n📍 {label} ({host})")
         lines.append(f"  Висящих образов: {result['dangling_count']}")
-        for row in result["df_raw"].splitlines():
-            lines.append(f"  {row}")
-    if not any_ok:
+
+        total_reclaimable_gb = 0.0
+        details = []
+        for row in result["rows"]:
+            rtype = row.get("Type", "?")
+            size = row.get("Size", "0B")
+            reclaimable = row.get("Reclaimable", "0B (0%)")
+            reclaimable_gb = parse_size_to_gb(reclaimable.split(" ")[0])
+            total_reclaimable_gb += reclaimable_gb
+            lines.append(f"  {rtype}: размер {size}, можно освободить {reclaimable}")
+            details.append(f"{rtype}: {size}, reclaimable {reclaimable}")
+
+        node_summaries.append((label, host, total_reclaimable_gb, result["dangling_count"], "; ".join(details)))
+
+    if skipped:
+        lines.append(f"\n⏸ Пропущены (maintenance): {', '.join(skipped)}")
+    if not any_ok and not skipped:
         lines.append("\nНи одна нода не ответила — проверь SSH_KEY_PATH.")
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await bot.send_message(chat, text[i:i+3500])
+
+    if node_summaries and OLLAMA_HOST:
+        node_summaries.sort(key=lambda x: -x[2])
+        summary_input = "\n".join(
+            f"{label} ({host}): reclaimable {gb:.1f} ГБ, dangling images {dc}. {det}"
+            for label, host, gb, dc, det in node_summaries
+        )
+        prompt = (
+            "Ты — ассистент домашнего сисадмина. Вот отчёт docker system df по нодам кластера "
+            "(reclaimable = место, которое можно освободить командой docker system prune):\n\n"
+            f"{summary_input}\n\n"
+            "Кратко на русском (4-6 предложений): какие ноды реально стоит почистить в первую очередь "
+            "(если reclaimable места мало — так и скажи, что чистить не к спеху), "
+            "и какую команду выполнить. Без вступлений, сразу по делу."
+        )
+        summary = await ask_ollama(prompt, timeout=90)
+        if summary:
+            await bot.send_message(chat, f"🤖 Резюме:\n{summary}")
 
 
 # ================= CONFIG DRIFT =================
@@ -440,6 +628,84 @@ async def job_config_drift(manual_chat_id: int | None = None):
         await bot.send_message(chat, text[i:i+3500], parse_mode="Markdown")
 
 
+# ================= BLAST RADIUS =================
+
+def parse_compose_paths():
+    result = []
+    for entry in COMPOSE_PATHS.split(","):
+        entry = entry.strip()
+        if not entry or "|" not in entry:
+            continue
+        host, path = entry.split("|", 1)
+        result.append((host.strip(), path.strip()))
+    return result
+
+
+def build_dependency_graph():
+    """SSH ко всем нодам, парсит docker-compose файлы, строит граф depends_on + сети."""
+    upstream = {}    # service -> [depends_on...]
+    downstream = {}  # service -> [кто от него зависит...]
+    siblings = {}     # service -> [остальные сервисы в том же compose-файле]
+    errors = []
+
+    for host, path in parse_compose_paths():
+        ok, content = ssh_run(host, f"cat {path}")
+        if not ok:
+            errors.append(f"{host}:{path} — {content[:100]}")
+            continue
+        try:
+            compose = yaml.safe_load(content)
+        except Exception as e:
+            errors.append(f"{host}:{path} — не распарсился YAML: {e}")
+            continue
+        services = (compose or {}).get("services", {})
+        names = list(services.keys())
+        for name, spec in services.items():
+            deps = spec.get("depends_on", [])
+            if isinstance(deps, dict):
+                deps = list(deps.keys())
+            upstream.setdefault(name, set()).update(deps)
+            for d in deps:
+                downstream.setdefault(d, set()).add(name)
+            siblings.setdefault(name, set()).update(s for s in names if s != name)
+
+    return upstream, downstream, siblings, errors
+
+
+async def job_blast_radius(service: str, manual_chat_id: int | None = None):
+    chat = manual_chat_id or CHAT_ID
+    if not parse_compose_paths():
+        await bot.send_message(chat, "COMPOSE_PATHS не задан в .env — нечего анализировать.")
+        return
+    loop = asyncio.get_event_loop()
+    upstream, downstream, siblings, errors = await loop.run_in_executor(None, build_dependency_graph)
+
+    if service not in upstream and service not in downstream and service not in siblings:
+        await bot.send_message(chat, f"Сервис '{service}' не найден ни в одном из отслеживаемых compose-файлов.")
+        return
+
+    lines = [f"💥 Blast radius для «{service}»:"]
+    deps = upstream.get(service, set())
+    if deps:
+        lines.append(f"\n⬆️ Зависит от (должны быть живы, чтобы {service} стартовал):")
+        lines.extend(f"  • {d}" for d in sorted(deps))
+    dependents = downstream.get(service, set())
+    if dependents:
+        lines.append(f"\n⬇️ От него зависят (упадут/не стартуют, если {service} остановить):")
+        lines.extend(f"  • {d}" for d in sorted(dependents))
+    sib = siblings.get(service, set())
+    if sib:
+        lines.append(f"\n↔️ Соседи по тому же compose-файлу (общая сеть):")
+        lines.extend(f"  • {s}" for s in sorted(sib))
+    if not deps and not dependents:
+        lines.append("\nПрямых зависимостей не найдено — сервис изолирован (в рамках отслеживаемых файлов).")
+    if errors:
+        lines.append(f"\n⚠️ Не удалось прочитать {len(errors)} compose-файлов:")
+        lines.extend(f"  {e}" for e in errors)
+
+    await bot.send_message(chat, "\n".join(lines))
+
+
 # ================= HANDLERS =================
 
 @dp.message(Command("start", "help"))
@@ -455,15 +721,24 @@ async def cmd_help(message: Message):
         "  /backup — проверка бэкапов (restore-тест)\n"
         "  /bloat — bloat Docker-образов по нодам\n"
         "  /drift — дрейф конфигов\n"
-        "  /rebaseline — принять текущие конфиги как baseline"
+        "  /rebaseline — принять текущие конфиги как baseline\n\n"
+        "Энтерпрайз:\n"
+        "  /maintenance <нода> <минуты> — заглушить алерты по ноде\n"
+        "  /maintenance_clear <нода> — снять заглушку\n"
+        "  /maintenance_list — активные заглушки\n"
+        "  /blast <сервис> — что уронит перезапуск/остановка сервиса\n"
+        "  /audit — последние команды\n\n"
+        f"Критичные алерты требуют подтверждения (кнопка), иначе повтор через {ESCALATION_MINUTES} мин."
     )
 
 @dp.message(Command("scan"))
 async def cmd_scan(message: Message):
+    log_audit("/scan", message.chat.id)
     await job_network_scan(manual_chat_id=message.chat.id)
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
+    log_audit("/status", message.chat.id)
     conn = db()
     row = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
@@ -474,6 +749,7 @@ async def cmd_status(message: Message):
 
 @dp.message(Command("hosts"))
 async def cmd_hosts(message: Message):
+    log_audit("/hosts", message.chat.id)
     conn = db()
     rows = conn.execute("SELECT host, port, proto, service, product FROM ports ORDER BY host, port").fetchall()
     conn.close()
@@ -492,6 +768,7 @@ async def cmd_hosts(message: Message):
 
 @dp.message(Command("findings"))
 async def cmd_findings(message: Message):
+    log_audit("/findings", message.chat.id)
     conn = db()
     rows = conn.execute("SELECT host, template, severity, info FROM findings ORDER BY id DESC LIMIT 20").fetchall()
     conn.close()
@@ -506,19 +783,23 @@ async def cmd_findings(message: Message):
 
 @dp.message(Command("backup"))
 async def cmd_backup(message: Message):
+    log_audit("/backup", message.chat.id)
     await message.answer("🔎 Проверяю бэкапы...")
     await job_backup_verify(manual_chat_id=message.chat.id)
 
 @dp.message(Command("bloat"))
 async def cmd_bloat(message: Message):
+    log_audit("/bloat", message.chat.id)
     await job_docker_bloat(manual_chat_id=message.chat.id)
 
 @dp.message(Command("drift"))
 async def cmd_drift(message: Message):
+    log_audit("/drift", message.chat.id)
     await job_config_drift(manual_chat_id=message.chat.id)
 
 @dp.message(Command("rebaseline"))
 async def cmd_rebaseline(message: Message):
+    log_audit("/rebaseline", message.chat.id)
     targets = parse_watch_paths()
     loop = asyncio.get_event_loop()
     updated = 0
@@ -529,6 +810,68 @@ async def cmd_rebaseline(message: Message):
                 f.write(content)
             updated += 1
     await message.answer(f"✅ Baseline обновлён для {updated}/{len(targets)} файлов.")
+
+@dp.message(Command("maintenance"))
+async def cmd_maintenance(message: Message):
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Использование: /maintenance <нода> <минуты>\nНапример: /maintenance host-196 60")
+        return
+    host, minutes_str = parts[1], parts[2]
+    try:
+        minutes = int(minutes_str)
+    except ValueError:
+        await message.answer("Минуты должны быть числом.")
+        return
+    log_audit(f"/maintenance {host} {minutes}", message.chat.id)
+    until = set_maintenance(host, minutes)
+    await message.answer(f"⏸ {host} в maintenance до {until[:16]} (алерты по этой ноде заглушены).")
+
+@dp.message(Command("maintenance_clear"))
+async def cmd_maintenance_clear(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /maintenance_clear <нода>")
+        return
+    host = parts[1]
+    log_audit(f"/maintenance_clear {host}", message.chat.id)
+    clear_maintenance(host)
+    await message.answer(f"▶️ {host} снят с maintenance.")
+
+@dp.message(Command("maintenance_list"))
+async def cmd_maintenance_list(message: Message):
+    active = list_maintenance()
+    if not active:
+        await message.answer("Активных заглушек нет.")
+        return
+    lines = ["⏸ Активные maintenance-окна:"]
+    for host, until, reason in active:
+        lines.append(f"  {host} — до {until[:16]}" + (f" ({reason})" if reason else ""))
+    await message.answer("\n".join(lines))
+
+@dp.message(Command("blast"))
+async def cmd_blast(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /blast <имя_сервиса>\nНапример: /blast jellyfin")
+        return
+    service = parts[1].strip()
+    log_audit(f"/blast {service}", message.chat.id)
+    await message.answer(f"🔎 Строю граф зависимостей для «{service}»...")
+    await job_blast_radius(service, manual_chat_id=message.chat.id)
+
+@dp.message(Command("audit"))
+async def cmd_audit(message: Message):
+    conn = db()
+    rows = conn.execute("SELECT command, ts FROM audit ORDER BY id DESC LIMIT 20").fetchall()
+    conn.close()
+    if not rows:
+        await message.answer("Аудит пуст.")
+        return
+    lines = ["Последние команды (sentry-ops):"]
+    for command, ts in rows:
+        lines.append(f"[{ts[:16]}] {command}")
+    await message.answer("\n".join(lines))
 
 
 # ================= MAIN =================
@@ -542,6 +885,7 @@ async def main():
     scheduler.add_job(job_backup_verify, "interval", hours=BACKUP_CHECK_INTERVAL_HOURS)
     scheduler.add_job(job_docker_bloat, "interval", hours=BLOAT_CHECK_INTERVAL_HOURS)
     scheduler.add_job(job_config_drift, "interval", hours=DRIFT_CHECK_INTERVAL_HOURS)
+    scheduler.add_job(job_check_escalations, "interval", minutes=ESCALATION_CHECK_MINUTES)
     scheduler.start()
 
     log.info("Sentry Ops bot starting")
