@@ -259,7 +259,8 @@ def run_nuclei(targets: list[str]):
         f.write("\n".join(targets))
     try:
         proc = subprocess.run(
-            ["nuclei", "-l", target_file, "-severity", NUCLEI_SEVERITY, "-jsonl", "-silent", "-timeout", "5"],
+            ["nuclei", "-l", target_file, "-severity", NUCLEI_SEVERITY, "-jsonl", "-silent",
+             "-timeout", "5", "-c", "25", "-rate-limit", "150"],
             capture_output=True, text=True, timeout=1200)
     except subprocess.TimeoutExpired:
         return []
@@ -472,9 +473,36 @@ def ssh_run(host: str, command: str, timeout=20) -> tuple[bool, str]:
         return False, str(e)
 
 
+def ssh_run_multi(host: str, commands: list[str], timeout=20) -> list[tuple[bool, str]]:
+    """Открывает ОДНО SSH-соединение и прогоняет через него несколько команд —
+    вместо коннекта заново на каждую (в 2+ раза быстрее для нод с несколькими проверками)."""
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, username=SSH_USER, key_filename=SSH_KEY_PATH, timeout=timeout)
+        results = []
+        for command in commands:
+            try:
+                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+                out = stdout.read().decode(errors="replace")
+                err = stderr.read().decode(errors="replace")
+                if err.strip() and not out.strip():
+                    results.append((False, err.strip()))
+                else:
+                    results.append((True, out))
+            except Exception as e:
+                results.append((False, str(e)))
+        client.close()
+        return results
+    except Exception as e:
+        return [(False, str(e))] * len(commands)
+
+
 def analyze_node_bloat(host: str, label: str) -> dict:
-    ok, df_out = ssh_run(host, "docker system df --format '{{json .}}' 2>/dev/null")
-    ok2, dangling_out = ssh_run(host, "docker images -f dangling=true --format '{{.Repository}}\t{{.Size}}' 2>/dev/null")
+    (ok, df_out), (ok2, dangling_out) = ssh_run_multi(host, [
+        "docker system df --format '{{json .}}' 2>/dev/null",
+        "docker images -f dangling=true --format '{{.Repository}}\t{{.Size}}' 2>/dev/null",
+    ])
     if not ok:
         return {"label": label, "host": host, "error": df_out}
     dangling_count = len([l for l in dangling_out.strip().splitlines() if l.strip()]) if ok2 and dangling_out.strip() else 0
@@ -506,17 +534,27 @@ async def job_docker_bloat(manual_chat_id: int | None = None):
     chat = manual_chat_id or CHAT_ID
     nodes = parse_nodes()
     loop = asyncio.get_event_loop()
-    await bot.send_message(chat, f"🔎 Docker на {len(nodes)} нодах...")
+    await bot.send_message(chat, f"🔎 Docker на {len(nodes)} нодах (параллельно)...")
     lines = ["🐳 Docker bloat отчёт:"]
     any_ok = False
     skipped = []
     node_summaries = []  # для AI-резюме: (label, host, reclaimable_gb, dangling_count, details)
 
+    active_nodes = []
     for host, label in nodes:
         if in_maintenance(host):
             skipped.append(label)
-            continue
-        result = await loop.run_in_executor(None, analyze_node_bloat, host, label)
+        else:
+            active_nodes.append((host, label))
+
+    # опрашиваем все ноды ОДНОВРЕМЕННО, а не по очереди
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, analyze_node_bloat, host, label)
+        for host, label in active_nodes
+    ])
+
+    for result in results:
+        host, label = result["host"], result["label"]
         if result.get("error"):
             lines.append(f"\n📍 {label} ({host}) — ❌ {result['error'][:150]}")
             continue
@@ -594,8 +632,14 @@ async def job_config_drift(manual_chat_id: int | None = None):
     os.makedirs(BASELINE_DIR, exist_ok=True)
     loop = asyncio.get_event_loop()
     drift_found, errors, new_baselines = [], [], []
-    for host, path in targets:
-        ok, content = await loop.run_in_executor(None, ssh_read_file, host, path)
+
+    # читаем файлы со всех нод ОДНОВРЕМЕННО, а не по очереди
+    read_results = await asyncio.gather(*[
+        loop.run_in_executor(None, ssh_read_file, host, path)
+        for host, path in targets
+    ])
+
+    for (host, path), (ok, content) in zip(targets, read_results):
         if not ok:
             errors.append(f"{host}:{path} — {content[:100]}")
             continue
@@ -802,9 +846,12 @@ async def cmd_rebaseline(message: Message):
     log_audit("/rebaseline", message.chat.id)
     targets = parse_watch_paths()
     loop = asyncio.get_event_loop()
+    read_results = await asyncio.gather(*[
+        loop.run_in_executor(None, ssh_read_file, host, path)
+        for host, path in targets
+    ])
     updated = 0
-    for host, path in targets:
-        ok, content = await loop.run_in_executor(None, ssh_read_file, host, path)
+    for (host, path), (ok, content) in zip(targets, read_results):
         if ok:
             with open(baseline_file_path(host, path), "w") as f:
                 f.write(content)
