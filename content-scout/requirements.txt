@@ -4,3 +4,4 @@ feedparser==6.0.11
 aiohttp==3.9.5
 PyYAML==6.0.1
 trafilatura==1.12.2
+deep-translator==1.11.4
