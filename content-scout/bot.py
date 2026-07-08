@@ -163,12 +163,22 @@ async def check_feeds_job(manual_chat_id: int | None = None):
     new_count = 0
 
     loop = asyncio.get_event_loop()
-    for feed in feeds:
-        name, url = feed["name"], feed["url"]
+
+    # скачиваем ВСЕ фиды одновременно — раньше они шли по очереди, это было медленно
+    async def fetch_one(feed):
         try:
-            parsed = await loop.run_in_executor(None, feedparser.parse, url)
+            return feed, await loop.run_in_executor(None, feedparser.parse, feed["url"])
         except Exception as e:
-            log.warning("Failed to fetch %s: %s", name, e)
+            log.warning("Failed to fetch %s: %s", feed["name"], e)
+            return feed, None
+
+    fetched = await asyncio.gather(*[fetch_one(feed) for feed in feeds])
+
+    # обработку записей (перевод + отправка) оставляем последовательной специально —
+    # у Google Translate и Telegram есть лимиты на частоту запросов, параллелить тут опасно
+    for feed, parsed in fetched:
+        name, url = feed["name"], feed["url"]
+        if parsed is None:
             continue
 
         for entry in parsed.entries[:30]:
