@@ -1,0 +1,6 @@
+aiogram==3.7.0
+APScheduler==3.10.4
+python-nmap==0.7.1
+aiohttp==3.9.5
+paramiko==3.4.0
+minio==7.2.7
