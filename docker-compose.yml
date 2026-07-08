@@ -15,11 +15,9 @@ services:
       - CHAT_ID=${SCOUT_CHAT_ID}
       # RSS
       - CHECK_INTERVAL_MINUTES=${SCOUT_CHECK_INTERVAL_MINUTES:-60}
-      # перевод статей (Ollama)
-      - OLLAMA_HOST=${OLLAMA_HOST:-}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:3b}
+      # перевод статей (deep-translator, без ИИ/LLM)
       - TRANSLATE_ENABLED=${TRANSLATE_ENABLED:-true}
-      - TRANSLATE_MAX_CHARS=${TRANSLATE_MAX_CHARS:-3000}
+      - TRANSLATE_MAX_CHARS=${TRANSLATE_MAX_CHARS:-4000}
       # resource waste
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://192.168.5.100:9090}
       - WASTE_CHECK_INTERVAL_HOURS=${WASTE_CHECK_INTERVAL_HOURS:-168}
