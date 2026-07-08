@@ -1,4 +1,0 @@
-aiogram==3.7.0
-APScheduler==3.10.4
-python-nmap==0.7.1
-aiohttp==3.9.5
