@@ -1,0 +1,4 @@
+aiogram==3.7.0
+APScheduler==3.10.4
+aiohttp==3.9.5
+minio==7.2.7
