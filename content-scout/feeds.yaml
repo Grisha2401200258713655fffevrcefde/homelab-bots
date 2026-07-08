@@ -1,0 +1,59 @@
+# Список источников. feedparser понимает любой RSS/Atom.
+# Reddit и Habr отдают RSS без ключей "из коробки".
+# Для YouTube: RSS = https://www.youtube.com/feeds/videos.xml?channel_id=UC....
+#   Channel ID достать просто: зайди на канал -> "Поделиться каналом" ->
+#   ссылка вида youtube.com/channel/UCxxxx — это и есть channel_id.
+#   (Ник вида @name сюда не подходит, нужен именно UC-id.)
+
+feeds:
+  # --- Reddit (без API-ключа) ---
+  - name: "r/homelab"
+    url: "https://www.reddit.com/r/homelab/new/.rss"
+  - name: "r/selfhosted"
+    url: "https://www.reddit.com/r/selfhosted/new/.rss"
+  - name: "r/DataHoarder"
+    url: "https://www.reddit.com/r/DataHoarder/new/.rss"
+  - name: "r/sysadmin"
+    url: "https://www.reddit.com/r/sysadmin/new/.rss"
+
+  # --- Habr (по хабам) ---
+  - name: "Habr: Системное администрирование"
+    url: "https://habr.com/ru/rss/hub/sys_admin/all/"
+  - name: "Habr: Сетевые технологии"
+    url: "https://habr.com/ru/rss/hub/network_technologies/all/"
+  - name: "Habr: Домашние компьютеры"
+    url: "https://habr.com/ru/rss/hub/homebrew/all/"
+
+  # --- Сайты/блоги ---
+  - name: "ServeTheHome"
+    url: "https://www.servethehome.com/feed/"
+  - name: "LowEndBox"
+    url: "https://lowendbox.com/feed/"
+
+  # --- YouTube (пример — подставь свои channel_id) ---
+  - name: "ServeTheHome (YouTube)"
+    url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCv6J_jJa8GJqFwQNgNrMuww"
+  # - name: "Craft Computing (YouTube)"
+  #   url: "https://www.youtube.com/feeds/videos.xml?channel_id=UC..."
+  # - name: "Techno Tim (YouTube)"
+  #   url: "https://www.youtube.com/feeds/videos.xml?channel_id=UC..."
+  # - name: "NetworkChuck (YouTube)"
+  #   url: "https://www.youtube.com/feeds/videos.xml?channel_id=UC..."
+
+# Ключевые слова для фильтрации (регистр не важен).
+# Пусто -> пропускать вообще всё из фида без фильтра.
+keywords:
+  - homelab
+  - proxmox
+  - server
+  - nas
+  - self-host
+  - selfhosted
+  - ceph
+  - zfs
+  - mergerfs
+  - docker
+  - kubernetes
+  - домашн
+  - сервер
+  - хранилищ
