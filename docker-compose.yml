@@ -37,6 +37,92 @@ services:
     volumes:
       - ./data/security-scanner:/app/data
 
+  # --- Бот 3: проверка бэкапов (реальный restore-тест) ---
+  backup-verify:
+    build: ./backup-verify
+    container_name: backup-verify
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${BACKUP_BOT_TOKEN}
+      - CHAT_ID=${BACKUP_CHAT_ID}
+      - CHECK_INTERVAL_HOURS=${BACKUP_CHECK_INTERVAL_HOURS:-168}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-}
+      - MINIO_BUCKET=${MINIO_BUCKET:-}
+      - MINIO_SECURE=${MINIO_SECURE:-false}
+      - DUPLICATI_URL=${DUPLICATI_URL:-}
+      - DUPLICATI_PASSWORD=${DUPLICATI_PASSWORD:-}
+    volumes:
+      - ./data/backup-verify:/app/data
+
+  # --- Бот 4: простаивающие ресурсы (Prometheus) ---
+  resource-waste:
+    build: ./resource-waste
+    container_name: resource-waste
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${WASTE_BOT_TOKEN}
+      - CHAT_ID=${WASTE_CHAT_ID}
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://192.168.5.100:9090}
+      - CHECK_INTERVAL_HOURS=${WASTE_CHECK_INTERVAL_HOURS:-168}
+      - LOOKBACK=${WASTE_LOOKBACK:-30d}
+      - CPU_IDLE_THRESHOLD_PCT=${WASTE_CPU_IDLE_THRESHOLD_PCT:-2}
+      - MIN_MEM_MB_TO_FLAG=${WASTE_MIN_MEM_MB:-100}
+
+  # --- Бот 5: bloat Docker-образов по всем нодам (SSH) ---
+  docker-bloat:
+    build: ./docker-bloat
+    container_name: docker-bloat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${BLOAT_BOT_TOKEN}
+      - CHAT_ID=${BLOAT_CHAT_ID}
+      - CHECK_INTERVAL_HOURS=${BLOAT_CHECK_INTERVAL_HOURS:-168}
+      - SSH_USER=${CLUSTER_SSH_USER:-admin1}
+      - SSH_KEY_PATH=/app/ssh/id_rsa
+      - NODES=${CLUSTER_NODES:-192.168.5.100:srv1,192.168.5.101:sand-box,192.168.5.102:host-196,192.168.5.104:hren-znaet,192.168.5.164:new-node,192.168.5.225:setevoipc}
+    volumes:
+      - ${SSH_KEY_HOST_PATH:-~/.ssh/id_rsa}:/app/ssh/id_rsa:ro
+
+  # --- Бот 6: истечение SSL-сертификатов ---
+  cert-monitor:
+    build: ./cert-monitor
+    container_name: cert-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${CERT_BOT_TOKEN}
+      - CHAT_ID=${CERT_CHAT_ID}
+      - CHECK_INTERVAL_HOURS=${CERT_CHECK_INTERVAL_HOURS:-24}
+      - WARN_DAYS=${CERT_WARN_DAYS:-14}
+      - TARGETS=${CERT_TARGETS:-}
+
+  # --- Бот 7: дрейф конфигов (SSH + сравнение с baseline) ---
+  config-drift:
+    build: ./config-drift
+    container_name: config-drift
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${DRIFT_BOT_TOKEN}
+      - CHAT_ID=${DRIFT_CHAT_ID}
+      - CHECK_INTERVAL_HOURS=${DRIFT_CHECK_INTERVAL_HOURS:-24}
+      - SSH_USER=${CLUSTER_SSH_USER:-admin1}
+      - SSH_KEY_PATH=/app/ssh/id_rsa
+      - WATCH_PATHS=${DRIFT_WATCH_PATHS:-}
+    volumes:
+      - ./data/config-drift:/app/data
+      - ${SSH_KEY_HOST_PATH:-~/.ssh/id_rsa}:/app/ssh/id_rsa:ro
+
   # --- Автообновление шаблонов Nuclei раз в сутки ---
   nuclei-updater:
     image: projectdiscovery/nuclei:latest
