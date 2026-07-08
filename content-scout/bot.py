@@ -26,11 +26,9 @@ CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "60"))
 DB_PATH = "/app/data/scout.db"
 FEEDS_PATH = "/app/feeds.yaml"
 
-# --- Перевод статей (Ollama, тот же HTTP-only принцип) ---
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+# --- Перевод статей (deep-translator / Google Translate, без ИИ и LLM) ---
 TRANSLATE_ENABLED = os.environ.get("TRANSLATE_ENABLED", "true").lower() == "true"
-TRANSLATE_MAX_CHARS = int(os.environ.get("TRANSLATE_MAX_CHARS", "3000"))
+TRANSLATE_MAX_CHARS = int(os.environ.get("TRANSLATE_MAX_CHARS", "4000"))
 
 # --- Resource waste (Prometheus, только чтение по HTTP) ---
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://192.168.5.100:9090")
@@ -125,24 +123,25 @@ async def fetch_article_text(url: str) -> str:
         return ""
 
 async def translate_to_russian(text: str) -> str:
-    """Переводит текст на русский через локальную Ollama. Возвращает '' при неудаче."""
-    if not OLLAMA_HOST or not text.strip():
+    """Переводит текст на русский через deep-translator (Google Translate веб-эндпоинт,
+    обычный машинный перевод, без LLM). Возвращает '' при неудаче."""
+    if not TRANSLATE_ENABLED or not text.strip():
         return ""
-    prompt = (
-        "Переведи следующий текст на русский язык. Отвечай ТОЛЬКО переводом, "
-        "без вступлений и комментариев, сохраняя структуру абзацев:\n\n" + text
-    )
+
+    def _translate_sync(t: str) -> str:
+        from deep_translator import GoogleTranslator
+        translator = GoogleTranslator(source="auto", target="ru")
+        # у Google Translate лимит ~5000 символов на запрос — режем на чанки по абзацам
+        chunk_size = 4500
+        chunks = [t[i:i + chunk_size] for i in range(0, len(t), chunk_size)]
+        translated = [translator.translate(c) for c in chunks]
+        return "\n".join(translated)
+
+    loop = asyncio.get_event_loop()
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{OLLAMA_HOST}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                data = await resp.json()
-                return data.get("response", "").strip()
+        return await loop.run_in_executor(None, _translate_sync, text)
     except Exception as e:
-        log.warning("Ollama translate failed: %s", e)
+        log.warning("Translate failed: %s", e)
         return ""
 
 def truncate(text: str, limit: int) -> str:
@@ -187,7 +186,7 @@ async def check_feeds_job(manual_chat_id: int | None = None):
             article_text = await fetch_article_text(link)
             body = article_text if article_text else summary
 
-            if TRANSLATE_ENABLED and OLLAMA_HOST and body and not is_mostly_russian(body):
+            if TRANSLATE_ENABLED and body and not is_mostly_russian(body):
                 to_translate = truncate(body, TRANSLATE_MAX_CHARS)
                 translation = await translate_to_russian(to_translate)
             else:
@@ -440,7 +439,7 @@ async def cmd_help(message: Message):
         "  /check — проверить фиды прямо сейчас\n"
         "  /sources — список источников\n"
         "  /stats — сколько всего найдено материалов\n"
-        f"  Перевод статей: {'включён' if (TRANSLATE_ENABLED and OLLAMA_HOST) else 'выключен'} "
+        f"  Перевод статей: {'включён' if TRANSLATE_ENABLED else 'выключен'} "
         f"(сначала 🇷🇺 перевод, потом 🇬🇧 оригинал)\n\n"
         "Наблюдение за кластером:\n"
         "  /waste — простаивающие контейнеры (Prometheus)\n"
