@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  # --- Бот 1: агрегатор контента (RSS/статьи/видео) ---
+  content-scout:
+    build: ./content-scout
+    container_name: content-scout
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${SCOUT_BOT_TOKEN}
+      - CHAT_ID=${SCOUT_CHAT_ID}
+      - CHECK_INTERVAL_MINUTES=${SCOUT_CHECK_INTERVAL_MINUTES:-60}
+    volumes:
+      - ./data/content-scout:/app/data
+
+  # --- Бот 2: авто-скан сети + Nuclei + Ollama-объяснения ---
+  security-scanner:
+    build: ./security-scanner
+    container_name: security-scanner
+    restart: unless-stopped
+    network_mode: "host"   # нужен для nmap raw-сканов подсети
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${SCANNER_BOT_TOKEN}
+      - CHAT_ID=${SCANNER_CHAT_ID}
+      - SUBNET=${SCANNER_SUBNET:-192.168.5.0/24}
+      - SCAN_INTERVAL_HOURS=${SCANNER_SCAN_INTERVAL_HOURS:-6}
+      - NUCLEI_SEVERITY=${SCANNER_NUCLEI_SEVERITY:-critical,high,medium}
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:3b}
+    volumes:
+      - ./data/security-scanner:/app/data
+
+  # --- Автообновление шаблонов Nuclei раз в сутки ---
+  nuclei-updater:
+    image: projectdiscovery/nuclei:latest
+    container_name: nuclei-updater
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c", "while true; do nuclei -update-templates; sleep 86400; done"]
+    volumes:
+      - nuclei-templates:/root/nuclei-templates
+
+volumes:
+  nuclei-templates:
