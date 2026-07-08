@@ -15,6 +15,11 @@ services:
       - CHAT_ID=${SCOUT_CHAT_ID}
       # RSS
       - CHECK_INTERVAL_MINUTES=${SCOUT_CHECK_INTERVAL_MINUTES:-60}
+      # перевод статей (Ollama)
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:3b}
+      - TRANSLATE_ENABLED=${TRANSLATE_ENABLED:-true}
+      - TRANSLATE_MAX_CHARS=${TRANSLATE_MAX_CHARS:-3000}
       # resource waste
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://192.168.5.100:9090}
       - WASTE_CHECK_INTERVAL_HOURS=${WASTE_CHECK_INTERVAL_HOURS:-168}
@@ -25,6 +30,14 @@ services:
       - CERT_CHECK_INTERVAL_HOURS=${CERT_CHECK_INTERVAL_HOURS:-24}
       - CERT_WARN_DAYS=${CERT_WARN_DAYS:-14}
       - CERT_TARGETS=${CERT_TARGETS:-}
+      # SLA / uptime
+      - SLA_CHECK_INTERVAL_HOURS=${SLA_CHECK_INTERVAL_HOURS:-168}
+      - SLA_LOOKBACK=${SLA_LOOKBACK:-30d}
+      - SLA_WARN_PCT=${SLA_WARN_PCT:-99.0}
+      # прогноз заполнения дисков
+      - FORECAST_CHECK_INTERVAL_HOURS=${FORECAST_CHECK_INTERVAL_HOURS:-24}
+      - FORECAST_LOOKBACK_DAYS=${FORECAST_LOOKBACK_DAYS:-14}
+      - FORECAST_WARN_DAYS=${FORECAST_WARN_DAYS:-30}
     volumes:
       - ./data/content-scout:/app/data
 
@@ -65,6 +78,11 @@ services:
       - CLUSTER_NODES=${CLUSTER_NODES:-192.168.5.100:srv1,192.168.5.101:sand-box,192.168.5.102:host-196,192.168.5.104:hren-znaet,192.168.5.164:new-node,192.168.5.225:setevoipc}
       - DRIFT_CHECK_INTERVAL_HOURS=${DRIFT_CHECK_INTERVAL_HOURS:-24}
       - DRIFT_WATCH_PATHS=${DRIFT_WATCH_PATHS:-}
+      # on-call эскалация
+      - ESCALATION_MINUTES=${ESCALATION_MINUTES:-30}
+      - ESCALATION_CHECK_MINUTES=${ESCALATION_CHECK_MINUTES:-10}
+      # blast radius (граф зависимостей docker-compose)
+      - COMPOSE_PATHS=${COMPOSE_PATHS:-}
     volumes:
       - ./data/sentry-ops:/app/data
       - ${SSH_KEY_HOST_PATH:-~/.ssh/id_rsa}:/app/ssh/id_rsa:ro
