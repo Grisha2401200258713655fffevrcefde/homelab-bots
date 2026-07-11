@@ -928,6 +928,23 @@ async def main():
     os.makedirs(BASELINE_DIR, exist_ok=True)
     db().close()
 
+    # регистрируем меню команд в Telegram (кнопка "/" рядом с полем ввода)
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="scan", description="Скан подсети + nuclei"),
+        BotCommand(command="status", description="Сводка последнего скана"),
+        BotCommand(command="hosts", description="Известные хосты/порты"),
+        BotCommand(command="findings", description="Находки Nuclei"),
+        BotCommand(command="backup", description="Проверка бэкапов"),
+        BotCommand(command="bloat", description="Bloat Docker-образов"),
+        BotCommand(command="drift", description="Дрейф конфигов"),
+        BotCommand(command="rebaseline", description="Принять текущие конфиги как baseline"),
+        BotCommand(command="maintenance", description="Заглушить алерты по ноде"),
+        BotCommand(command="maintenance_list", description="Активные заглушки"),
+        BotCommand(command="blast", description="Что уронит сервис"),
+        BotCommand(command="audit", description="Последние команды"),
+    ])
+
     scheduler.add_job(job_network_scan, "interval", hours=SCAN_INTERVAL_HOURS)
     scheduler.add_job(job_backup_verify, "interval", hours=BACKUP_CHECK_INTERVAL_HOURS)
     scheduler.add_job(job_docker_bloat, "interval", hours=BLOAT_CHECK_INTERVAL_HOURS)
