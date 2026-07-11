@@ -9,6 +9,7 @@ import re
 import sqlite3
 import subprocess
 import tarfile
+import threading
 import zipfile
 from datetime import datetime, timedelta
 
@@ -203,7 +204,9 @@ async def job_check_escalations():
 
 def run_nmap_scan(subnet: str):
     scanner = nmap.PortScanner()
-    scanner.scan(hosts=subnet, arguments="-sV -T4 --top-ports 200")
+    # --min-rate разгоняет отправку пакетов, --host-timeout не даёт зависнуть
+    # на молчащих/отфильтрованных хостах на много минут
+    scanner.scan(hosts=subnet, arguments="-sV -T4 --top-ports 200 --min-rate 300 --host-timeout 60s")
     results = {}
     for host in scanner.all_hosts():
         if scanner[host].state() != "up":
@@ -457,45 +460,82 @@ async def job_backup_verify(manual_chat_id: int | None = None):
 
 # ================= DOCKER BLOAT =================
 
-def ssh_run(host: str, command: str, timeout=20) -> tuple[bool, str]:
-    try:
+# ---------- SSH connection pool (переиспользуем соединения, не коннектимся заново на каждую команду) ----------
+_ssh_pool: dict[str, paramiko.SSHClient] = {}
+_ssh_pool_lock = threading.Lock()
+
+
+def _get_ssh_client(host: str, timeout: int) -> paramiko.SSHClient:
+    """Возвращает живое SSH-соединение к хосту из пула, переподключаясь только если
+    соединения нет или оно умерло. Один транспорт спокойно держит много параллельных
+    exec_command вызовов (paramiko открывает под каждый отдельный канал)."""
+    with _ssh_pool_lock:
+        client = _ssh_pool.get(host)
+        if client is not None:
+            transport = client.get_transport()
+            if transport is not None and transport.is_active():
+                return client
+            try:
+                client.close()
+            except Exception:
+                pass
+            del _ssh_pool[host]
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(host, username=SSH_USER, key_filename=SSH_KEY_PATH, timeout=timeout)
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)  # держим соединение живым между прогонами
+        _ssh_pool[host] = client
+        return client
+
+
+def ssh_run(host: str, command: str, timeout=20) -> tuple[bool, str]:
+    try:
+        client = _get_ssh_client(host, timeout)
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
-        client.close()
         if err.strip() and not out.strip():
             return False, err.strip()
         return True, out
     except Exception as e:
-        return False, str(e)
+        # соединение могло протухнуть между прогонами — выкидываем из пула, попробуем один раз заново
+        _ssh_pool.pop(host, None)
+        try:
+            client = _get_ssh_client(host, timeout)
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            out = stdout.read().decode(errors="replace")
+            err = stderr.read().decode(errors="replace")
+            if err.strip() and not out.strip():
+                return False, err.strip()
+            return True, out
+        except Exception as e2:
+            return False, str(e2)
 
 
 def ssh_run_multi(host: str, commands: list[str], timeout=20) -> list[tuple[bool, str]]:
-    """Открывает ОДНО SSH-соединение и прогоняет через него несколько команд —
-    вместо коннекта заново на каждую (в 2+ раза быстрее для нод с несколькими проверками)."""
+    """Прогоняет несколько команд через ОДНО (пуловое) соединение — каждая команда
+    открывает свой канал на уже живом транспорте, коннект заново не нужен."""
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(host, username=SSH_USER, key_filename=SSH_KEY_PATH, timeout=timeout)
-        results = []
-        for command in commands:
-            try:
-                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-                out = stdout.read().decode(errors="replace")
-                err = stderr.read().decode(errors="replace")
-                if err.strip() and not out.strip():
-                    results.append((False, err.strip()))
-                else:
-                    results.append((True, out))
-            except Exception as e:
-                results.append((False, str(e)))
-        client.close()
-        return results
+        client = _get_ssh_client(host, timeout)
     except Exception as e:
         return [(False, str(e))] * len(commands)
+
+    results = []
+    for command in commands:
+        try:
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            out = stdout.read().decode(errors="replace")
+            err = stderr.read().decode(errors="replace")
+            if err.strip() and not out.strip():
+                results.append((False, err.strip()))
+            else:
+                results.append((True, out))
+        except Exception as e:
+            results.append((False, str(e)))
+    return results
 
 
 def analyze_node_bloat(host: str, label: str) -> dict:
@@ -927,6 +967,12 @@ async def main():
     os.makedirs("/app/data", exist_ok=True)
     os.makedirs(BASELINE_DIR, exist_ok=True)
     db().close()
+
+    # Явно расширяем пул потоков: нагрузка тут I/O-bound (SSH, HTTP, subprocess-и ждут сеть),
+    # а не CPU-bound — дефолтный executor (min(32, cpu+4)) на слабом CPU слишком мал
+    # для параллельных SSH-сессий на 6+ нод одновременно.
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_event_loop().set_default_executor(ThreadPoolExecutor(max_workers=24))
 
     # регистрируем меню команд в Telegram (кнопка "/" рядом с полем ввода)
     from aiogram.types import BotCommand
