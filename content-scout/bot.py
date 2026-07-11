@@ -29,6 +29,10 @@ FEEDS_PATH = "/app/feeds.yaml"
 # --- Перевод статей (deep-translator / Google Translate, без ИИ и LLM) ---
 TRANSLATE_ENABLED = os.environ.get("TRANSLATE_ENABLED", "true").lower() == "true"
 TRANSLATE_MAX_CHARS = int(os.environ.get("TRANSLATE_MAX_CHARS", "4000"))
+# Сколько НОВЫХ материалов обрабатывать (скачать+перевести+отправить) за один прогон.
+# Остальные не отмечаются как виденные и подхватятся следующим циклом — так /check
+# не виснет на 20+ минут при большом бэклоге (перевод+извлечение текста — не быстрая штука).
+MAX_NEW_ITEMS_PER_RUN = int(os.environ.get("MAX_NEW_ITEMS_PER_RUN", "8"))
 
 # --- Resource waste (Prometheus, только чтение по HTTP) ---
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://192.168.5.100:9090")
@@ -173,6 +177,7 @@ async def check_feeds_job(manual_chat_id: int | None = None):
             return feed, None
 
     fetched = await asyncio.gather(*[fetch_one(feed) for feed in feeds])
+    throttled = False  # достигли лимита за этот прогон — остальное оставляем на потом
 
     # обработку записей (перевод + отправка) оставляем последовательной специально —
     # у Google Translate и Telegram есть лимиты на частоту запросов, параллелить тут опасно
@@ -190,6 +195,13 @@ async def check_feeds_job(manual_chat_id: int | None = None):
             if not matches_keywords(f"{title} {summary}", keywords):
                 mark_seen(conn, link, name, title)
                 continue
+
+            if new_count >= MAX_NEW_ITEMS_PER_RUN:
+                # лимит на этот прогон исчерпан — НЕ помечаем виденным,
+                # заберём в следующий раз (автопроверка или ручной /check)
+                throttled = True
+                continue
+
             mark_seen(conn, link, name, title)
             new_count += 1
 
@@ -221,9 +233,16 @@ async def check_feeds_job(manual_chat_id: int | None = None):
 
     conn.commit()
     conn.close()
-    if manual_chat_id and new_count == 0:
-        await bot.send_message(chat, "Новых материалов по теме не найдено.")
-    log.info("Feed check done, %d new items sent", new_count)
+    if manual_chat_id:
+        if new_count == 0:
+            await bot.send_message(chat, "Новых материалов по теме не найдено.")
+        elif throttled:
+            await bot.send_message(
+                chat,
+                f"Обработал {new_count} материалов (лимит за прогон: {MAX_NEW_ITEMS_PER_RUN}). "
+                f"Остальные из очереди — при следующей автопроверке или повторном /check."
+            )
+    log.info("Feed check done, %d new items sent, throttled=%s", new_count, throttled)
 
 # ---------- Prometheus helpers ----------
 async def prom_query(query: str):
@@ -520,6 +539,19 @@ async def cmd_audit(message: Message):
 async def main():
     os.makedirs("/app/data", exist_ok=True)
     db().close()
+
+    # регистрируем меню команд в Telegram (кнопка "/" рядом с полем ввода)
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="check", description="Проверить фиды прямо сейчас"),
+        BotCommand(command="sources", description="Список источников"),
+        BotCommand(command="stats", description="Сколько материалов найдено"),
+        BotCommand(command="waste", description="Простаивающие контейнеры"),
+        BotCommand(command="certs", description="Истечение SSL-сертификатов"),
+        BotCommand(command="sla", description="Аптайм сервисов за месяц"),
+        BotCommand(command="forecast", description="Прогноз заполнения дисков"),
+        BotCommand(command="audit", description="Последние команды"),
+    ])
 
     scheduler.add_job(check_feeds_job, "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.add_job(job_resource_waste, "interval", hours=WASTE_CHECK_INTERVAL_HOURS)
