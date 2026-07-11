@@ -27,7 +27,7 @@ CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "60"))
 DB_PATH = "/app/data/scout.db"
 FEEDS_PATH = "/app/feeds.yaml"
 
-# --- Перевод статей (deep-translator / Google Translate, без ИИ и LLM) ---
+# --- Перевод статей (argos-translate, ОФЛАЙН — модель локальная, без сети и без ИИ/LLM) ---
 TRANSLATE_ENABLED = os.environ.get("TRANSLATE_ENABLED", "true").lower() == "true"
 TRANSLATE_MAX_CHARS = int(os.environ.get("TRANSLATE_MAX_CHARS", "4000"))
 # Сколько НОВЫХ материалов обрабатывать (скачать+перевести+отправить) за один прогон.
@@ -132,23 +132,20 @@ async def fetch_article_text(url: str) -> str:
         log.warning("Не смог извлечь текст из %s: %s", url, e)
         return ""
 
-TRANSLATE_TIMEOUT_SECONDS = int(os.environ.get("TRANSLATE_TIMEOUT_SECONDS", "20"))
+TRANSLATE_TIMEOUT_SECONDS = int(os.environ.get("TRANSLATE_TIMEOUT_SECONDS", "60"))
 
 async def translate_to_russian(text: str) -> str:
-    """Переводит текст на русский через deep-translator (Google Translate веб-эндпоинт,
-    обычный машинный перевод, без LLM). Возвращает '' при неудаче ИЛИ если не уложились
-    в TRANSLATE_TIMEOUT_SECONDS — у deep-translator нет своего таймаута на запрос,
-    без внешнего wait_for он может зависнуть навсегда, если сеть до Google подвиснет."""
+    """Переводит текст на русский через argos-translate — полностью ОФЛАЙН,
+    модель скачана один раз при сборке образа, без сетевых запросов при переводе.
+    Медленнее Google на слабом CPU, зато никогда не зависает из-за сети."""
     if not TRANSLATE_ENABLED or not text.strip():
         return ""
 
     def _translate_sync(t: str) -> str:
-        from deep_translator import GoogleTranslator
-        translator = GoogleTranslator(source="auto", target="ru")
-        # у Google Translate лимит ~5000 символов на запрос — режем на чанки по абзацам
-        chunk_size = 4500
-        chunks = [t[i:i + chunk_size] for i in range(0, len(t), chunk_size)]
-        translated = [translator.translate(c) for c in chunks]
+        import argostranslate.translate
+        # переводим по абзацам — так модель не давится большими кусками текста разом
+        paragraphs = [p for p in t.split("\n") if p.strip()]
+        translated = [argostranslate.translate.translate(p, "en", "ru") for p in paragraphs]
         return "\n".join(translated)
 
     loop = asyncio.get_event_loop()
@@ -196,7 +193,7 @@ async def check_feeds_job(manual_chat_id: int | None = None):
     throttled = False  # достигли лимита за этот прогон — остальное оставляем на потом
 
     # обработку записей (перевод + отправка) оставляем последовательной специально —
-    # у Google Translate и Telegram есть лимиты на частоту запросов, параллелить тут опасно
+    # у Telegram есть лимит на частоту сообщений, параллелить отправку тут опасно
     for feed, parsed in fetched:
         name, url = feed["name"], feed["url"]
         if parsed is None:
