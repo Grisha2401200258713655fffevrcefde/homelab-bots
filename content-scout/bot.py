@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -113,22 +114,31 @@ async def fetch_article_text(url: str) -> str:
     """Скачивает страницу и вытаскивает основной текст статьи (без меню/рекламы)."""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15),
                                     headers={"User-Agent": "Mozilla/5.0 (homelab content-scout bot)"}) as resp:
                 html = await resp.text(errors="replace")
     except Exception as e:
         log.warning("Не смог скачать %s: %s", url, e)
         return ""
+
+    loop = asyncio.get_event_loop()
     try:
-        extracted = trafilatura.extract(html, include_comments=False, include_tables=False)
+        # extract — синхронный разбор HTML, может быть небыстрым на больших страницах;
+        # раньше вызывался напрямую и блокировал ВЕСЬ event loop бота на это время
+        extract_fn = functools.partial(trafilatura.extract, html, include_comments=False, include_tables=False)
+        extracted = await asyncio.wait_for(loop.run_in_executor(None, extract_fn), timeout=15)
         return extracted or ""
     except Exception as e:
         log.warning("Не смог извлечь текст из %s: %s", url, e)
         return ""
 
+TRANSLATE_TIMEOUT_SECONDS = int(os.environ.get("TRANSLATE_TIMEOUT_SECONDS", "20"))
+
 async def translate_to_russian(text: str) -> str:
     """Переводит текст на русский через deep-translator (Google Translate веб-эндпоинт,
-    обычный машинный перевод, без LLM). Возвращает '' при неудаче."""
+    обычный машинный перевод, без LLM). Возвращает '' при неудаче ИЛИ если не уложились
+    в TRANSLATE_TIMEOUT_SECONDS — у deep-translator нет своего таймаута на запрос,
+    без внешнего wait_for он может зависнуть навсегда, если сеть до Google подвиснет."""
     if not TRANSLATE_ENABLED or not text.strip():
         return ""
 
@@ -143,7 +153,13 @@ async def translate_to_russian(text: str) -> str:
 
     loop = asyncio.get_event_loop()
     try:
-        return await loop.run_in_executor(None, _translate_sync, text)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _translate_sync, text),
+            timeout=TRANSLATE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Translate timed out after %ss — пропускаю перевод для этого материала", TRANSLATE_TIMEOUT_SECONDS)
+        return ""
     except Exception as e:
         log.warning("Translate failed: %s", e)
         return ""
