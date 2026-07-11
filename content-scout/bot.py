@@ -540,6 +540,11 @@ async def main():
     os.makedirs("/app/data", exist_ok=True)
     db().close()
 
+    # Явно расширяем пул потоков: скачивание фидов/статей и перевод — I/O-bound,
+    # дефолтный executor на слабом CPU слишком мал для параллельного скачивания 10+ фидов.
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_event_loop().set_default_executor(ThreadPoolExecutor(max_workers=16))
+
     # регистрируем меню команд в Telegram (кнопка "/" рядом с полем ввода)
     from aiogram.types import BotCommand
     await bot.set_my_commands([
