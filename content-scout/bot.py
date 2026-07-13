@@ -178,6 +178,7 @@ async def check_feeds_job(manual_chat_id: int | None = None):
     feeds, keywords = load_config()
     conn = db()
     new_count = 0
+    started = datetime.utcnow()
 
     loop = asyncio.get_event_loop()
 
@@ -246,16 +247,19 @@ async def check_feeds_job(manual_chat_id: int | None = None):
 
     conn.commit()
     conn.close()
+    elapsed = (datetime.utcnow() - started).total_seconds()
     if manual_chat_id:
         if new_count == 0:
-            await bot.send_message(chat, "Новых материалов по теме не найдено.")
+            await bot.send_message(chat, f"Новых материалов по теме не найдено. ⏱ {elapsed:.1f} сек.")
         elif throttled:
             await bot.send_message(
                 chat,
                 f"Обработал {new_count} материалов (лимит за прогон: {MAX_NEW_ITEMS_PER_RUN}). "
-                f"Остальные из очереди — при следующей автопроверке или повторном /check."
+                f"Остальные из очереди — при следующей автопроверке или повторном /check. ⏱ {elapsed:.1f} сек."
             )
-    log.info("Feed check done, %d new items sent, throttled=%s", new_count, throttled)
+        else:
+            await bot.send_message(chat, f"⏱ Готово за {elapsed:.1f} сек.")
+    log.info("Feed check done, %d new items sent, throttled=%s, elapsed=%.1fs", new_count, throttled, elapsed)
 
 # ---------- Prometheus helpers ----------
 async def prom_query(query: str):
