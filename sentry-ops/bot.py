@@ -204,9 +204,12 @@ async def job_check_escalations():
 
 def run_nmap_scan(subnet: str):
     scanner = nmap.PortScanner()
-    # --min-rate разгоняет отправку пакетов, --host-timeout не даёт зависнуть
-    # на молчащих/отфильтрованных хостах на много минут
-    scanner.scan(hosts=subnet, arguments="-sV -T4 --top-ports 200 --min-rate 300 --host-timeout 60s")
+    # -T5 (максимальная агрессивность, безопасно в локалке) + --min-rate 1000 (не ждать,
+    # слать пакеты пачками) + -n (не резолвить DNS на каждый хост — лишние секунды)
+    # + --version-intensity 0 (лёгкие пробы баннеров вместо полного перебора — быстрее,
+    # чуть менее подробно, но для обнаружения http-сервисов для nuclei хватает)
+    scanner.scan(hosts=subnet, arguments="-sV -T5 -n --top-ports 200 --min-rate 1000 "
+                                          "--version-intensity 0 --host-timeout 45s")
     results = {}
     for host in scanner.all_hosts():
         if scanner[host].state() != "up":
@@ -263,7 +266,7 @@ def run_nuclei(targets: list[str]):
     try:
         proc = subprocess.run(
             ["nuclei", "-l", target_file, "-severity", NUCLEI_SEVERITY, "-jsonl", "-silent",
-             "-timeout", "5", "-c", "25", "-rate-limit", "150"],
+             "-timeout", "4", "-c", "50", "-rate-limit", "500", "-disable-clustering"],
             capture_output=True, text=True, timeout=1200)
     except subprocess.TimeoutExpired:
         return []
@@ -349,13 +352,20 @@ async def job_network_scan(manual_chat_id: int | None = None):
         findings = await loop.run_in_executor(None, run_nuclei, targets)
         store_findings(findings)
         if findings:
-            for f in findings[:15]:
+            top_findings = findings[:15]
+            # объяснения от Ollama запрашиваем ОДНОВРЕМЕННО, а не по одной находке —
+            # раньше 15 находок = 15 последовательных ожиданий ответа модели
+            explanations = await asyncio.gather(*[
+                explain_finding(f"{f.get('info', {}).get('name', f.get('template-id', ''))} "
+                                 f"on {f.get('host', '')}, severity {f.get('info', {}).get('severity', 'unknown')}")
+                for f in top_findings
+            ])
+            for f, explanation in zip(top_findings, explanations):
                 sev = f.get("info", {}).get("severity", "unknown")
                 name = f.get("info", {}).get("name", f.get("template-id", ""))
                 host = f.get("host", "")
                 emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(sev, "⚪")
                 text = f"{emoji} [{sev.upper()}] {host}\n{name}"
-                explanation = await explain_finding(f"{name} on {host}, severity {sev}")
                 if explanation:
                     text += f"\n💡 {explanation}"
                 if sev in ("critical", "high"):
