@@ -352,9 +352,16 @@ async def job_cert_check(manual_chat_id: int | None = None):
         await bot.send_message(chat, "CERT_TARGETS не задан в .env")
         return
     loop = asyncio.get_event_loop()
+
+    # TLS-хендшейки идут ОДНОВРЕМЕННО по всем целям, а не по очереди —
+    # каждый может занимать до 10 сек, при 5+ доменах это складывалось в десятки секунд
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, check_cert, host, port)
+        for host, port in targets
+    ])
+
     lines, problems = [], 0
-    for host, port in targets:
-        result = await loop.run_in_executor(None, check_cert, host, port)
+    for (host, port), result in zip(targets, results):
         if not result["ok"]:
             problems += 1
             lines.append(f"❌ {host}:{port} — {result['error']}")
