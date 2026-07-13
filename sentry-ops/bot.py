@@ -316,6 +316,7 @@ async def explain_finding(text: str) -> str:
 async def job_network_scan(manual_chat_id: int | None = None):
     chat = manual_chat_id or CHAT_ID
     await bot.send_message(chat, f"🔎 Скан подсети {SUBNET}...")
+    started = datetime.utcnow()
     loop = asyncio.get_event_loop()
     scan_results = await loop.run_in_executor(None, run_nmap_scan, SUBNET)
     new_entries, closed_entries = diff_and_store(scan_results)
@@ -374,6 +375,9 @@ async def job_network_scan(manual_chat_id: int | None = None):
                     await bot.send_message(chat, text)
         else:
             await bot.send_message(chat, "✅ Nuclei ничего не нашёл.")
+
+    elapsed = (datetime.utcnow() - started).total_seconds()
+    await bot.send_message(chat, f"⏱ Скан завершён за {elapsed:.1f} сек.")
 
 
 # ================= BACKUP VERIFY =================
@@ -584,6 +588,7 @@ async def job_docker_bloat(manual_chat_id: int | None = None):
     chat = manual_chat_id or CHAT_ID
     nodes = parse_nodes()
     loop = asyncio.get_event_loop()
+    started = datetime.utcnow()
     await bot.send_message(chat, f"🔎 Docker на {len(nodes)} нодах (параллельно)...")
     lines = ["🐳 Docker bloat отчёт:"]
     any_ok = False
@@ -650,6 +655,9 @@ async def job_docker_bloat(manual_chat_id: int | None = None):
         summary = await ask_ollama(prompt, timeout=90)
         if summary:
             await bot.send_message(chat, f"🤖 Резюме:\n{summary}")
+
+    elapsed = (datetime.utcnow() - started).total_seconds()
+    await bot.send_message(chat, f"⏱ Отчёт собран за {elapsed:.1f} сек.")
 
 
 # ================= CONFIG DRIFT =================
